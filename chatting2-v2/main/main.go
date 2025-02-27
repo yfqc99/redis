@@ -27,6 +27,7 @@ type userList struct {
 
 var (
 	userl userList
+	msg   chan string
 	wg    sync.WaitGroup
 	ctx   = context.Background()
 	rdb   = redis.NewClient(&redis.Options{
@@ -45,13 +46,10 @@ func main() {
 		fmt.Println("网络连接错误", err)
 		return
 	}
+	msg = make(chan string)
 	userl.List = make(map[string]User)
 	//提前清空键值对
 	rdb.Del(ctx, "rank")
-	wg.Add(1)
-	//订阅
-	//从开始订阅不缺少消息
-	go subscribe()
 	for {
 		//只有当有新的客户端发送连接请求的时候会创立连接，否则就会一直等待
 		conn, err := listen.Accept()
@@ -60,28 +58,12 @@ func main() {
 			continue
 		}
 		message, user := getUser(conn)
-		wg.Add(1)
+		wg.Add(2)
 		go accept(conn, user)
-		// 发布消息
-		rdb.Publish(ctx, "chat", message)
+		go send()
+		msg <- message
 	}
 	wg.Wait()
-}
-
-// 订阅消息
-func subscribe() {
-	pubsub := rdb.Subscribe(ctx, "chat")
-	//等待消息
-	for {
-		msg, err := pubsub.ReceiveMessage(ctx)
-		if err != nil {
-			fmt.Println("无法获得消息", err)
-			time.Sleep(1 * time.Second)
-			continue
-		}
-		send(msg.Payload)
-	}
-	defer wg.Done()
 }
 
 // 排行
@@ -143,7 +125,7 @@ label:
 
 // 写入日志
 func record(msg string) {
-	filePath := "G:/goProject/src/chatting2-v3/document/record.txt"
+	filePath := "G:/goProject/src/chatting2/document/record.txt"
 	file, err := os.OpenFile(filePath, os.O_WRONLY|os.O_APPEND, 0666)
 	if err != nil {
 		fmt.Println("无法进行记录", err)
@@ -172,7 +154,7 @@ func accept(conn net.Conn, user User) {
 			userl.mu.Lock()
 			delete(userl.List, user.name)
 			userl.mu.Unlock()
-			rdb.Publish(ctx, "chat", user.name+"已经下线")
+			msg <- user.name + "已经下线"
 			//将成员从有序集合中删除
 			rdb.ZRem(ctx, "rank", user.name)
 			record(time + " " + user.name + "已经下线")
@@ -190,9 +172,7 @@ func accept(conn net.Conn, user User) {
 			continue
 		}
 		str := user.name + ":" + strings.Trim(str1, " \r\n")
-		//msg <- str
-		//发布消息
-		rdb.Publish(ctx, "chat", str)
+		msg <- str
 		//将该成员对应的分数加1
 		rdb.ZIncrBy(ctx, "rank", float64(1), user.name)
 		fmt.Println(time + " " + str)
@@ -201,19 +181,23 @@ func accept(conn net.Conn, user User) {
 }
 
 // 广播
-func send(message string) {
-	userl.mu.Lock()
-	for name, user := range userl.List {
-		if strings.Split(message, ":")[0] == name {
-			continue
+func send() {
+	for {
+		message := <-msg
+		userl.mu.Lock()
+		for name, user := range userl.List {
+			if strings.Split(message, ":")[0] == name {
+				continue
+			}
+			str, _ := utils.Encode(message)
+			// 发送数据
+			_, err := user.conn.Write(str)
+			if err != nil {
+				fmt.Println(name, "已下线", err)
+				delete(userl.List, name)
+			}
 		}
-		str, err := utils.Encode(message)
-		// 发送数据
-		user.conn.Write(str)
-		if err != nil {
-			fmt.Println(name, "已下线", err)
-			delete(userl.List, name)
-		}
+		userl.mu.Unlock()
 	}
-	userl.mu.Unlock()
+	defer wg.Done()
 }
