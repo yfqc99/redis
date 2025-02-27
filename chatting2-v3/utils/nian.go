@@ -55,5 +55,5 @@ func Decode(reader *bufio.Reader) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return string(pack[4:]), nil
+	return string(pack[4:]), err
 }

@@ -3,8 +3,9 @@ package main
 import (
 	"bufio"
 	"chatting2/utils"
+	"context"
 	"fmt"
-	"github.com/google/uuid"
+	"github.com/go-redis/redis/v8"
 	"net"
 	"os"
 	"strings"
@@ -13,7 +14,7 @@ import (
 )
 
 type User struct {
-	id   uuid.UUID
+	//id   uuid.UUID
 	name string
 	conn net.Conn
 }
@@ -26,14 +27,17 @@ type userList struct {
 
 var (
 	userl userList
-	msg   chan string
 	wg    sync.WaitGroup
+	ctx   = context.Background()
+	rdb   = redis.NewClient(&redis.Options{
+		Addr:     "192.168.157.129:6379",
+		Password: "",
+		DB:       0,
+	})
 )
 
-//存在问题：服务端和客户端异常掉线后，都会分别进入死循环
-//心跳检测应该可以解决
-
 func main() {
+	defer rdb.Close()
 	fmt.Println("等待连接")
 	//监听连接
 	listen, err := net.Listen("tcp", "0.0.0.0:8888")
@@ -41,8 +45,13 @@ func main() {
 		fmt.Println("网络连接错误", err)
 		return
 	}
-	msg = make(chan string)
 	userl.List = make(map[string]User)
+	//提前清空键值对
+	rdb.Del(ctx, "rank")
+	wg.Add(1)
+	//订阅
+	//从开始订阅不缺少消息
+	go subscribe()
 	for {
 		//只有当有新的客户端发送连接请求的时候会创立连接，否则就会一直等待
 		conn, err := listen.Accept()
@@ -51,12 +60,43 @@ func main() {
 			continue
 		}
 		message, user := getUser(conn)
-		wg.Add(2)
+		wg.Add(1)
 		go accept(conn, user)
-		go send()
-		msg <- message
+		// 发布消息
+		rdb.Publish(ctx, "chat", message)
 	}
 	wg.Wait()
+}
+
+// 订阅消息
+func subscribe() {
+	pubsub := rdb.Subscribe(ctx, "chat")
+	//等待消息
+	for {
+		msg, err := pubsub.ReceiveMessage(ctx)
+		if err != nil {
+			fmt.Println("无法获得消息", err)
+			time.Sleep(1 * time.Second)
+			continue
+		}
+		send(msg.Payload)
+	}
+	defer wg.Done()
+}
+
+// 排行
+func rank() []string {
+	//获得排行
+	res, err := rdb.ZRevRange(ctx, "rank", 0, -1).Result()
+	if err != nil {
+		fmt.Println("获取排行失败", err)
+	}
+	//处理原始数组
+	indexStr := make([]string, len(res))
+	for i, r := range res {
+		indexStr[i] = fmt.Sprintf("%d	%s", i+1, r)
+	}
+	return indexStr
 }
 
 // 得到客户端信息
@@ -79,7 +119,7 @@ label:
 		goto label
 	}
 	user := User{
-		id:   uuid.New(),
+		//id:   uuid.New(),
 		name: username,
 		conn: conn,
 	}
@@ -91,12 +131,19 @@ label:
 	time := time.Now().String()
 	fmt.Println(time + " " + username + "登录")
 	record(time + " " + username + "登录")
+	//添加到有序集合序列
+	m := redis.Z{
+		Score:  0,
+		Member: username,
+	}
+	//这里可以和上面处理重复问题合并一下
+	rdb.ZAddNX(ctx, "rank", &m)
 	return message, user
 }
 
 // 写入日志
 func record(msg string) {
-	filePath := "G:/goProject/src/chatting2/document/record.txt"
+	filePath := "G:/goProject/src/chatting2-v3/document/record.txt"
 	file, err := os.OpenFile(filePath, os.O_WRONLY|os.O_APPEND, 0666)
 	if err != nil {
 		fmt.Println("无法进行记录", err)
@@ -113,18 +160,21 @@ func record(msg string) {
 func accept(conn net.Conn, user User) {
 	defer conn.Close()
 	for {
+		//if _,err := conn.Read()
 		//存储客户端发送的数据
 		reader := bufio.NewReader(conn)
 		//读取到客户端发送过来的数据
-		str1, _ := utils.Decode(reader)
+		str1, err := utils.Decode(reader)
 		time := time.Now().String()
 		//输入exit 退出
-		if strings.Trim(str1, "\r\n") == "exit" {
+		if strings.Trim(str1, "\r\n") == "exit" || err != nil {
 			fmt.Println(time + " " + user.name + "已经下线")
 			userl.mu.Lock()
 			delete(userl.List, user.name)
 			userl.mu.Unlock()
-			msg <- user.name + "已经下线"
+			rdb.Publish(ctx, "chat", user.name+"已经下线")
+			//将成员从有序集合中删除
+			rdb.ZRem(ctx, "rank", user.name)
 			record(time + " " + user.name + "已经下线")
 			wg.Done()
 			//当下线时给客户端发送同意的消息
@@ -132,31 +182,38 @@ func accept(conn net.Conn, user User) {
 			conn.Write(str)
 			break
 		}
+		if strings.Trim(str1, "\r\n") == "rank" {
+			rank := rank()
+			str := strings.Join(rank, "\n")
+			str1, _ := utils.Encode(str)
+			conn.Write(str1)
+			continue
+		}
 		str := user.name + ":" + strings.Trim(str1, " \r\n")
-		msg <- str
+		//msg <- str
+		//发布消息
+		rdb.Publish(ctx, "chat", str)
+		//将该成员对应的分数加1
+		rdb.ZIncrBy(ctx, "rank", float64(1), user.name)
 		fmt.Println(time + " " + str)
 		record(time + " " + str)
 	}
 }
 
 // 广播
-func send() {
-	for {
-		message := <-msg
-		userl.mu.Lock()
-		for name, user := range userl.List {
-			if strings.Split(message, ":")[0] == name {
-				continue
-			}
-			str, _ := utils.Encode(message)
-			// 发送数据
-			_, err := user.conn.Write(str)
-			if err != nil {
-				fmt.Println(name, "已下线", err)
-				delete(userl.List, name)
-			}
+func send(message string) {
+	userl.mu.Lock()
+	for name, user := range userl.List {
+		if strings.Split(message, ":")[0] == name {
+			continue
 		}
-		userl.mu.Unlock()
+		str, err := utils.Encode(message)
+		// 发送数据
+		user.conn.Write(str)
+		if err != nil {
+			fmt.Println(name, "已下线", err)
+			delete(userl.List, name)
+		}
 	}
-	defer wg.Done()
+	userl.mu.Unlock()
 }
