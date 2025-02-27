@@ -42,9 +42,11 @@ func sending(conn net.Conn) {
 		//向服务器发送数据
 		_, err1 := conn.Write(str)
 		if strings.Trim(msg, "\r\n") == "exit" {
-			fmt.Println("已退出登录，再见")
 			wg.Done()
 			break
+		}
+		if strings.Trim(msg, "\r\n") == "rank" {
+			fmt.Println("------排行榜------")
 		}
 		if err1 != nil {
 			fmt.Println("z发送失败", err1)
@@ -59,7 +61,12 @@ func accept(conn net.Conn) {
 		//存储接收到的数据
 		reader := bufio.NewReader(conn)
 		//读取数据
-		str1, _ := utils.Decode(reader)
+		str1, err := utils.Decode(reader)
+		if err != nil {
+			fmt.Println("服务端异常退出")
+			//关停客户端程序
+			os.Exit(1)
+		}
 		str := strings.Trim(str1, " \r\n")
 		if str == "ok" {
 			break
