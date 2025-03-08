@@ -3,9 +3,42 @@ package utils
 import (
 	"bufio"
 	"bytes"
+	"fmt"
+	"github.com/go-redis/redis/v8"
+	"os"
+
 	//binary实现数字与字节序列之间的简单转换，以及变长整数（varint）的编码和解码
 	"encoding/binary"
 )
+
+type Data struct {
+	TypeId  int    `json:"typeId"`
+	Message string `json:"message"`
+}
+
+func Stream(name string, msg map[string]interface{}) *redis.XAddArgs {
+	return &redis.XAddArgs{
+		Stream: name,
+		ID:     "*",
+		Values: msg,
+	}
+}
+
+func InitLog(filePath string) *os.File {
+	file, err := os.OpenFile(filePath, os.O_WRONLY|os.O_APPEND, 0666)
+	if err != nil {
+		fmt.Println("无法进行记录", err)
+	}
+	return file
+}
+
+func Record(file *os.File, msg string) {
+	//带缓存区写入
+	writer := bufio.NewWriter(file)
+	writer.WriteString(msg + "\r\n")
+	//将缓冲区的内容写入文件
+	writer.Flush()
+}
 
 // Encode 将消息编码
 func Encode(message string) ([]byte, error) {
@@ -55,5 +88,5 @@ func Decode(reader *bufio.Reader) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return string(pack[4:]), nil
+	return string(pack[4:]), err
 }
